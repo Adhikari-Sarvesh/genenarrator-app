@@ -1,0 +1,5 @@
+streamlit
+pandas
+PyYAML
+google-genai
+requests

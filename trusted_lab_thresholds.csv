@@ -1,0 +1,11 @@
+analyte,unit,flag_logic
+LDL-C,mg/dL,>=160:High;>=130:Borderline;else:Normal
+HDL-C,mg/dL,<40:Low;>=60:Optimal;else:Normal
+Triglycerides,mg/dL,>=200:High;>=150:Borderline;else:Normal
+Fasting Glucose,mg/dL,>=126:Diabetes;>=100:Prediabetes;else:Normal
+HbA1c,%,>=6.5:Diabetes;>=5.7:Prediabetes;else:Normal
+Hemoglobin,g/dL,<12:Low;>16:High;else:Normal
+Ferritin,ng/mL,<30:Low;>300:High;else:Normal
+TSH,mIU/L,>4.0:High;<0.4:Low;else:Normal
+25(OH)D,ng/mL,<20:Deficient;<30:Insufficient;>100:High;else:Sufficient
+Creatinine,mg/dL,>1.3:High;<0.6:Low;else:Normal
