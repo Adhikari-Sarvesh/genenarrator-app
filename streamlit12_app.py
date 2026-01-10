@@ -1,16 +1,17 @@
+# streamlit5_app.py
 import os
 import json
 import streamlit as st
 import pandas as pd
 import yaml
 
-# Gemini SDK
+# ✅ Gemini (cloud narration)
 from google import genai
 
-# Trait → analyte resolver
+# ✅ Your trait→analyte filter module
 from trait_analyte_resolver import filter_gwas_to_supported_traits
 
-# Robust Drive download
+# ✅ For robust Google Drive download (handles big files)
 import requests
 from io import BytesIO
 
@@ -21,7 +22,8 @@ GWAS_DRIVE_FILE_ID = "1F92lf8My0699QVdCfPx_HbYmgc_WHjLx"
 THRESHOLDS_FILE = "trusted_lab_thresholds.csv"
 TRAIT_MAP_FILE = "trait_to_labs_partial.yaml"
 
-DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")  # default to lite
+# Default to lite to maximize free-tier usability (override via Secrets/env if you want)
+DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
 
 # -----------------------------
@@ -29,43 +31,34 @@ DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")  # def
 # -----------------------------
 def _download_gdrive_file(file_id: str) -> bytes:
     if not file_id:
-        raise RuntimeError("GWAS_DRIVE_FILE_ID is not set.")
+        raise RuntimeError("GWAS_DRIVE_FILE_ID is not set. Paste your Google Drive FILE_ID in the code.")
 
     session = requests.Session()
     url = "https://drive.google.com/uc?export=download"
-    resp = session.get(url, params={"id": file_id}, stream=True)
+    response = session.get(url, params={"id": file_id}, stream=True)
 
-    # Large file confirm token
     token = None
-    for k, v in resp.cookies.items():
+    for k, v in response.cookies.items():
         if k.startswith("download_warning"):
             token = v
             break
-    if token:
-        resp = session.get(url, params={"id": file_id, "confirm": token}, stream=True)
 
-    resp.raise_for_status()
+    if token:
+        response = session.get(url, params={"id": file_id, "confirm": token}, stream=True)
+
+    response.raise_for_status()
 
     data = BytesIO()
-    for chunk in resp.iter_content(chunk_size=1024 * 1024):  # 1MB
+    for chunk in response.iter_content(chunk_size=1024 * 1024):
         if chunk:
             data.write(chunk)
     return data.getvalue()
 
 
-@st.cache_data(show_spinner="Loading GWAS reference data… (first time may take 10–30s)")
+@st.cache_data(show_spinner="Loading GWAS reference data… (first time may take ~10–30s)")
 def load_gwas_from_drive(file_id: str) -> pd.DataFrame:
     raw = _download_gdrive_file(file_id)
-    df = pd.read_csv(BytesIO(raw), low_memory=False)
-
-    # Normalize rsid column
-    if "rsid" in df.columns:
-        df["rsid"] = df["rsid"].astype(str).str.lower().str.strip()
-    elif "SNPS" in df.columns:
-        df["rsid"] = df["SNPS"].astype(str).str.lower().str.strip()
-    else:
-        raise RuntimeError("GWAS file must contain an 'rsid' or 'SNPS' column.")
-    return df
+    return pd.read_csv(BytesIO(raw), low_memory=False)
 
 
 @st.cache_data(show_spinner="Loading lab thresholds…")
@@ -73,7 +66,7 @@ def load_thresholds(path: str) -> pd.DataFrame:
     return pd.read_csv(path, low_memory=False)
 
 
-@st.cache_data(show_spinner="Loading trait → lab mapping…")
+@st.cache_data(show_spinner="Loading trait→lab mapping…")
 def load_trait_map(path: str) -> dict:
     with open(path, "r") as f:
         raw_map = yaml.safe_load(f) or {}
@@ -95,7 +88,7 @@ def load_gemini_client():
         api_key = os.getenv("GEMINI_API_KEY")
 
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY not set. Add it in Streamlit Secrets.")
+        raise RuntimeError("GEMINI_API_KEY not set. Set it in Streamlit Secrets or env.")
 
     return genai.Client(api_key=api_key)
 
@@ -103,10 +96,9 @@ def load_gemini_client():
 gemini_client = load_gemini_client()
 
 
-def gemini_generate_once(prompt: str, model_name: str = DEFAULT_GEMINI_MODEL) -> str:
+def gemini_narrate_once(prompt: str, model_name: str = DEFAULT_GEMINI_MODEL) -> str:
     """
-    ONE-CALL Gemini generation.
-    Includes fallback to flash if lite fails.
+    One-call narration. Includes fallback to flash if lite fails.
     """
     try:
         resp = gemini_client.models.generate_content(model=model_name, contents=prompt)
@@ -115,12 +107,12 @@ def gemini_generate_once(prompt: str, model_name: str = DEFAULT_GEMINI_MODEL) ->
         try:
             resp = gemini_client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
             return (resp.text or "").strip()
-        except Exception as e2:
-            return f"(Narration unavailable due to Gemini API error: {e2})"
+        except Exception as e:
+            return f"(Narration unavailable due to Gemini API error: {e})"
 
 
 # -----------------------------
-# HELPERS
+# LAB FLAG PARSER
 # -----------------------------
 def parse_flag_logic(logic, value):
     try:
@@ -151,6 +143,9 @@ def parse_flag_logic(logic, value):
     return "Unknown"
 
 
+# -----------------------------
+# INPUT NORMALIZATION + GENETIC LOGIC
+# -----------------------------
 def normalize_rsid(x: str) -> str:
     return str(x).strip().lower()
 
@@ -184,6 +179,7 @@ def extract_risk_allele_from_row(row) -> str | None:
                 cand = s.split("-")[-1]
                 if cand in {"A", "C", "G", "T"}:
                     return cand
+
     return None
 
 
@@ -200,6 +196,9 @@ def compute_genetic_risk(user_gt: str, risk_allele: str | None) -> str:
         return "Uncertain: effect allele not detected in genotype (allele validation will improve in future)"
 
 
+# -----------------------------
+# ANALYTE-LEVEL AGGREGATION
+# -----------------------------
 def _risk_bucket(genetic_risk: str) -> str:
     gr = (genetic_risk or "").lower()
     if gr.startswith("high"):
@@ -215,6 +214,7 @@ def compute_genetic_influence(n_high: int, n_moderate: int, n_uncertain: int, n_
     total = n_high + n_moderate + n_uncertain + n_unknown
     if total == 0:
         return "Weak"
+
     if n_high >= 1 or n_moderate >= 3:
         return "Strong"
     if 1 <= n_moderate <= 2:
@@ -261,27 +261,24 @@ def build_analyte_summary(fused_df: pd.DataFrame) -> pd.DataFrame:
             "genes": ", ".join(genes[:8]) + (" ..." if len(genes) > 8 else ""),
         })
 
-    out = pd.DataFrame(rows)
+    # Keep your original style sorting
+    return pd.DataFrame(rows).sort_values(
+        by=["lab_flag", "genetic_influence", "analyte"],
+        ascending=[True, True, True]
+    )
 
-    # Simple sort (flag text is not strictly ordered; still ok)
-    return out.sort_values(by=["analyte"], ascending=[True])
 
-
-def build_single_prompt(analyte_summary_df: pd.DataFrame) -> str:
-    """
-    Build ONE prompt for Gemini:
-      - Returns JSON so parsing is easy.
-      - Contains analyte-wise narration + overall summary.
-    """
-    analytes_payload = analyte_summary_df.to_dict(orient="records")
+# -----------------------------
+# ONE-CALL PROMPT BUILDER + SAFE JSON PARSER
+# -----------------------------
+def build_one_call_prompt(analyte_summary_df: pd.DataFrame) -> str:
+    payload = analyte_summary_df.to_dict(orient="records")
 
     return f"""
 You are a careful, friendly health explainer. DO NOT diagnose. Use cautious language like "may", "is associated with", "could indicate".
-Focus on lab interpretation first. Use genetics only as supportive context, and if genetics is "Limited evidence" or many Unknown/Uncertain, say genetics is inconclusive.
+Focus on lab interpretation first. Use genetics only as supportive context.
 
-TASK:
-Return STRICT JSON ONLY (no markdown). Use exactly this schema:
-
+Return STRICT JSON ONLY (no markdown), exactly this schema:
 {{
   "analytes": [
     {{
@@ -293,30 +290,23 @@ Return STRICT JSON ONLY (no markdown). Use exactly this schema:
 }}
 
 INPUT DATA (array of analyte objects):
-{json.dumps(analytes_payload, ensure_ascii=False)}
+{json.dumps(payload, ensure_ascii=False)}
 """.strip()
 
 
 def safe_parse_json(text: str) -> dict | None:
-    """
-    Attempts to parse model output into JSON.
-    If Gemini adds extra text, try to extract the JSON block.
-    """
     if not text:
         return None
-    text = text.strip()
-
-    # Direct parse
+    t = text.strip()
     try:
-        return json.loads(text)
+        return json.loads(t)
     except Exception:
         pass
 
-    # Try extract from first { to last }
-    start = text.find("{")
-    end = text.rfind("}")
+    start = t.find("{")
+    end = t.rfind("}")
     if start != -1 and end != -1 and end > start:
-        chunk = text[start:end+1]
+        chunk = t[start:end + 1]
         try:
             return json.loads(chunk)
         except Exception:
@@ -326,78 +316,64 @@ def safe_parse_json(text: str) -> dict | None:
 
 
 # -----------------------------
-# STREAMLIT UI
+# STREAMLIT UI (KEEP ALIGNMENT LIKE YOUR ORIGINAL)
 # -----------------------------
-st.set_page_config(page_title="GeneNarrator+", layout="wide")
-
+st.set_page_config(page_title="🧬 GeneNarrator+", layout="wide")
 st.title("🧬 GeneNarrator+")
-st.caption("Teal-themed, layperson-friendly narration from SNPs + labs (educational use only).")
 
-with st.expander("✅ Setup checklist (only for you)", expanded=False):
-    st.write("- Drive file must be public: Anyone with link → Viewer")
-    st.write("- Streamlit Secrets must contain GEMINI_API_KEY")
-    st.write("- Optional Secrets: GEMINI_MODEL=gemini-2.5-flash-lite")
+# --- GENETIC INPUT ---
+st.subheader("🔬 Genetic Input (RSID + Genotype)")
 
-st.divider()
+if "snp_inputs" not in st.session_state:
+    st.session_state["snp_inputs"] = [{"rsid": "", "genotype": ""}]
 
-# --- INPUTS ---
-left, right = st.columns([1, 1], gap="large")
+btn1, btn2, btn3 = st.columns([1, 1, 2])
+with btn1:
+    if st.button("➕ Add RSID"):
+        st.session_state["snp_inputs"].append({"rsid": "", "genotype": ""})
+with btn2:
+    if st.button("🗑 Remove Last") and len(st.session_state["snp_inputs"]) > 1:
+        st.session_state["snp_inputs"].pop()
 
-with left:
-    st.subheader("🔬 Genetic Inputs")
-    st.write("Add RSIDs and genotypes (AA/AG/CT etc.).")
+for i, item in enumerate(st.session_state["snp_inputs"]):
+    c1, c2 = st.columns([2, 1])
+    item["rsid"] = c1.text_input(
+        f"RSID {i+1}",
+        value=item["rsid"],
+        key=f"rsid_{i}",
+        placeholder="e.g., rs753381 (any case accepted)"
+    )
+    item["genotype"] = c2.text_input(
+        f"Genotype {i+1}",
+        value=item["genotype"],
+        key=f"geno_{i}",
+        placeholder="e.g., CT / AA / gg (any case accepted)"
+    )
 
-    if "snp_inputs" not in st.session_state:
-        st.session_state["snp_inputs"] = [{"rsid": "", "genotype": ""}]
+confirm = st.button("✅ Confirm & Analyze")
 
-    a, b, _ = st.columns([1, 1, 2])
-    with a:
-        if st.button("➕ Add"):
-            st.session_state["snp_inputs"].append({"rsid": "", "genotype": ""})
-    with b:
-        if st.button("🗑 Remove") and len(st.session_state["snp_inputs"]) > 1:
-            st.session_state["snp_inputs"].pop()
+# --- BLOOD TEST SLIDERS ---
+st.subheader("🧪 Adjust Blood Test Values Manually")
 
-    for i, item in enumerate(st.session_state["snp_inputs"]):
-        c1, c2 = st.columns([2, 1])
-        item["rsid"] = c1.text_input(
-            f"RSID {i+1}",
-            value=item["rsid"],
-            key=f"rsid_{i}",
-            placeholder="e.g., rs1801133"
-        )
-        item["genotype"] = c2.text_input(
-            f"Genotype {i+1}",
-            value=item["genotype"],
-            key=f"geno_{i}",
-            placeholder="e.g., CT"
-        )
+analyte_defaults = {
+    "Hemoglobin": (8.0, 18.0, 14.0),
+    "LDL-C": (50, 200, 110),
+    "HDL-C": (20, 100, 50),
+    "Triglycerides": (50, 400, 140),
+    "Fasting Glucose": (60, 200, 95),
+    "HbA1c": (4.0, 12.0, 5.6),
+    "Ferritin": (5, 400, 100),
+    "TSH": (0.1, 10.0, 2.0),
+    "25(OH)D": (5, 100, 35),
+    "Creatinine": (0.4, 2.0, 1.0),
+}
 
-with right:
-    st.subheader("🧪 Blood Test Inputs")
-    st.write("Adjust values (manual sliders).")
+user_values = {}
+cols = st.columns(3)
+for idx, (analyte, (mn, mx, default)) in enumerate(analyte_defaults.items()):
+    with cols[idx % 3]:
+        user_values[analyte] = st.slider(analyte, mn, mx, default)
 
-    analyte_defaults = {
-        "Hemoglobin": (8.0, 18.0, 14.0),
-        "LDL-C": (50, 200, 110),
-        "HDL-C": (20, 100, 50),
-        "Triglycerides": (50, 400, 140),
-        "Fasting Glucose": (60, 200, 95),
-        "HbA1c": (4.0, 12.0, 5.6),
-        "Ferritin": (5, 400, 100),
-        "TSH": (0.1, 10.0, 2.0),
-        "25(OH)D": (5, 100, 35),
-        "Creatinine": (0.4, 2.0, 1.0),
-    }
-
-    user_values = {}
-    cols = st.columns(2)
-    for idx, (analyte, (mn, mx, default)) in enumerate(analyte_defaults.items()):
-        with cols[idx % 2]:
-            user_values[analyte] = st.slider(analyte, mn, mx, default)
-
-st.divider()
-confirm = st.button("✅ Confirm & Analyze", use_container_width=True)
 
 # -----------------------------
 # ANALYZE
@@ -414,7 +390,7 @@ if confirm:
         gt = normalize_genotype(gt_raw)
 
         if not rsid:
-            continue  # allow blanks
+            continue
 
         if not rsid.startswith("rs"):
             errors.append(f"Row {i}: RSID '{rsid_raw}' is invalid (must start with rs).")
@@ -427,146 +403,136 @@ if confirm:
         cleaned_inputs.append({"rsid": rsid, "genotype": gt})
 
     if errors:
-        st.error("⚠️ Fix these input errors:")
+        st.error("⚠️ Please fix these input errors:")
         for e in errors:
             st.write("- " + e)
 
     if not cleaned_inputs:
         st.warning("⚠️ Please enter at least one valid RSID + Genotype.")
-        st.stop()
+    else:
+        # Load datasets
+        gwas_df = load_gwas_from_drive(GWAS_DRIVE_FILE_ID)
+        thresholds_df = load_thresholds(THRESHOLDS_FILE)
+        trait_map = load_trait_map(TRAIT_MAP_FILE)
 
-    # Load datasets
-    gwas_df = load_gwas_from_drive(GWAS_DRIVE_FILE_ID)
-    thresholds_df = load_thresholds(THRESHOLDS_FILE)
-    trait_map = load_trait_map(TRAIT_MAP_FILE)
+        # Normalize GWAS rsid
+        if "rsid" in gwas_df.columns:
+            gwas_df["rsid"] = gwas_df["rsid"].astype(str).str.lower().str.strip()
+        elif "SNPS" in gwas_df.columns:
+            gwas_df["rsid"] = gwas_df["SNPS"].astype(str).str.lower().str.strip()
+        else:
+            st.error("GWAS file must contain an 'rsid' or 'SNPS' column.")
+            st.stop()
 
-    # Threshold dict
-    threshold_dict = {
-        row["analyte"]: row["flag_logic"]
-        for _, row in thresholds_df.iterrows()
-        if "analyte" in thresholds_df.columns and "flag_logic" in thresholds_df.columns
-    }
+        threshold_dict = {
+            row["analyte"]: row["flag_logic"]
+            for _, row in thresholds_df.iterrows()
+            if "analyte" in thresholds_df.columns and "flag_logic" in thresholds_df.columns
+        }
 
-    # User genotype map
-    user_gt_map = {d["rsid"]: d["genotype"] for d in cleaned_inputs}
-    rsid_list = list(user_gt_map.keys())
+        user_gt_map = {d["rsid"]: d["genotype"] for d in cleaned_inputs}
+        rsid_list = list(user_gt_map.keys())
 
-    # Filter GWAS to input rsids
-    gwas_hits = gwas_df[gwas_df["rsid"].isin(rsid_list)].copy()
-    if gwas_hits.empty:
-        st.warning("No RSIDs were found in the GWAS dataset.")
-        st.stop()
+        gwas_hits = gwas_df[gwas_df["rsid"].isin(rsid_list)].copy()
+        if gwas_hits.empty:
+            st.warning("No RSIDs were found in the GWAS dataset.")
+            st.stop()
 
-    # Filter traits to supported analytes
-    allowed_analytes = list(user_values.keys())
-    gwas_hits = filter_gwas_to_supported_traits(gwas_hits, trait_map, allowed_analytes)
-    if gwas_hits.empty:
-        st.warning("RSIDs found, but none of the linked traits match your supported analytes/traits.")
-        st.stop()
+        allowed_analytes = list(user_values.keys())
+        gwas_hits = filter_gwas_to_supported_traits(gwas_hits, trait_map, allowed_analytes)
+        if gwas_hits.empty:
+            st.warning("RSIDs found, but none of the linked traits match your supported analytes/traits.")
+            st.stop()
 
-    # Build fused rows
-    fused_rows = []
-    for _, g in gwas_hits.iterrows():
-        trait = g.get("DISEASE/TRAIT", "")
-        rsid = g["rsid"]
-        gene = g.get("MAPPED_GENE", g.get("REPORTED GENE(S)", ""))
+        fused_rows = []
+        for _, g in gwas_hits.iterrows():
+            trait = g.get("DISEASE/TRAIT", "")
+            rsid = g["rsid"]
+            gene = g.get("MAPPED_GENE", g.get("REPORTED GENE(S)", ""))
 
-        user_gt = user_gt_map.get(rsid, "")
-        risk_allele = extract_risk_allele_from_row(g)
-        genetic_risk = compute_genetic_risk(user_gt, risk_allele)
+            user_gt = user_gt_map.get(rsid, "")
+            risk_allele = extract_risk_allele_from_row(g)
+            genetic_risk = compute_genetic_risk(user_gt, risk_allele)
 
-        analytes = g.get("__resolved_analytes", None)
-        if not analytes:
-            continue
-
-        for analyte in analytes:
-            if analyte not in user_values:
+            analytes = g.get("__resolved_analytes", None)
+            if not analytes:
                 continue
 
-            value = float(user_values[analyte])
-            flag_logic = threshold_dict.get(analyte)
-            flag = parse_flag_logic(flag_logic, value) if flag_logic else "Not available"
+            for analyte in analytes:
+                if analyte not in user_values:
+                    continue
 
-            fused_rows.append({
-                "patient_id": "ManualInput",
-                "rsid": rsid,
-                "user_genotype": user_gt,
-                "risk_allele": risk_allele if risk_allele else "Unknown",
-                "genetic_risk": genetic_risk,
-                "trait": trait,
-                "analyte": analyte,
-                "lab_value": value,
-                "lab_flag": flag,
-                "gene": gene,
-            })
+                value = float(user_values[analyte])
+                flag_logic = threshold_dict.get(analyte)
+                flag = parse_flag_logic(flag_logic, value) if flag_logic else "Not available"
 
-    if not fused_rows:
-        st.warning("No fused rows were produced after filtering.")
-        st.stop()
+                fused_rows.append({
+                    "patient_id": "ManualInput",
+                    "rsid": rsid,
+                    "user_genotype": user_gt,
+                    "risk_allele": risk_allele if risk_allele else "Unknown",
+                    "genetic_risk": genetic_risk,
+                    "trait": trait,
+                    "analyte": analyte,
+                    "lab_value": value,
+                    "lab_flag": flag,
+                    "gene": gene,
+                })
 
-    fused_df = pd.DataFrame(fused_rows)
-    analyte_summary_df = build_analyte_summary(fused_df)
+        if not fused_rows:
+            st.warning("No fused rows were produced after filtering.")
+            st.stop()
 
-    st.session_state["fused_df"] = fused_df
-    st.session_state["analyte_summary_df"] = analyte_summary_df
-    st.session_state["narration_json"] = None
-    st.success("✅ Analysis complete. Scroll down for results.")
+        fused_df = pd.DataFrame(fused_rows)
+        analyte_summary_df = build_analyte_summary(fused_df)
+
+        st.session_state["fused_df"] = fused_df
+        st.session_state["analyte_summary_df"] = analyte_summary_df
+        st.session_state["narration_json"] = None
+
+        st.subheader("🔗 Fused Genetic + Lab Table (Filtered Traits Only)")
+        st.dataframe(fused_df, use_container_width=True)
+
+        st.subheader("📌 Analyte-Level Summary (Recommended for narration)")
+        st.dataframe(analyte_summary_df, use_container_width=True)
 
 
 # -----------------------------
-# RESULTS DISPLAY
+# NARRATION (Gemini) - ONE CALL
 # -----------------------------
-if "fused_df" in st.session_state and "analyte_summary_df" in st.session_state:
-    fused_df = st.session_state["fused_df"]
-    analyte_summary_df = st.session_state["analyte_summary_df"]
+if "analyte_summary_df" in st.session_state:
+    if st.button("🗣️ Narrate This Report (Gemini - One Call)"):
+        prompt = build_one_call_prompt(st.session_state["analyte_summary_df"])
+        raw = gemini_narrate_once(prompt)
 
-    st.subheader("🔗 Fused Genetic + Lab Table (Filtered Traits Only)")
-    st.dataframe(fused_df, use_container_width=True)
-
-    st.subheader("📌 Analyte-Level Summary (used for narration)")
-    st.dataframe(analyte_summary_df, use_container_width=True)
-
-    st.divider()
-
-    # -----------------------------
-    # ONE-CALL NARRATION
-    # -----------------------------
-    st.subheader("🗣️ Narration (One Gemini Call)")
-    st.caption("This button uses only ONE request, saving your free-tier limits.")
-
-    if st.button("Generate Narration", type="primary", use_container_width=True):
-        prompt = build_single_prompt(analyte_summary_df)
-        output = gemini_generate_once(prompt)
-
-        parsed = safe_parse_json(output)
+        parsed = safe_parse_json(raw)
         if not parsed or "analytes" not in parsed or "overall_summary" not in parsed:
-            st.error("Gemini did not return valid JSON. Showing raw output below.")
-            st.code(output)
+            st.error("Gemini did not return valid JSON. Showing raw output:")
+            st.code(raw)
         else:
             st.session_state["narration_json"] = parsed
-            st.success("✅ Narration generated in one call!")
-
-    # Display narration
-    if st.session_state.get("narration_json"):
-        data = st.session_state["narration_json"]
-
-        st.subheader("🩵 Overall Health Summary")
-        st.write(data.get("overall_summary", ""))
-
-        st.subheader("📣 Analyte Narrations")
-        for i, item in enumerate(data.get("analytes", []), start=1):
-            st.markdown(f"### {i}. {item.get('analyte','(unknown)')}")
-            st.write(item.get("narration", ""))
+            st.success("✅ Narration generated using ONE Gemini call!")
 
 
-# -----------------------------
-# DISCLAIMER
-# -----------------------------
+# --- DISPLAY NARRATION ---
+if st.session_state.get("narration_json"):
+    data = st.session_state["narration_json"]
+
+    st.subheader("🩵 Overall Health Summary")
+    st.write(data.get("overall_summary", ""))
+
+    st.subheader("📣 Layperson-Friendly Narration (Analyte-wise)")
+    for i, item in enumerate(data.get("analytes", []), start=1):
+        st.markdown(f"### {i}. {item.get('analyte', '(unknown)')}")
+        st.write(item.get("narration", ""))
+
+
+# --- DISCLAIMER ---
 st.markdown(
     """
-    <div style='background-color:#fff3cd; padding:12px; border-radius:12px;
-                border:2px solid #f5c06f; text-align:center; font-size:16px;
-                color:#856404; font-weight:700;'>
+    <div style='background-color:#fff3cd; padding:10px; border-radius:10px;
+                border:2px solid #f5c06f; text-align:center; font-size:18px;
+                color:#856404; font-weight:bold;'>
     ⚠️ DISCLAIMER: This application is for informational and educational purposes only.
     It does <u>not</u> replace consultation with qualified healthcare professionals.
     </div>
