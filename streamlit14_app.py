@@ -565,6 +565,7 @@ if confirm:
         gwas_df = load_gwas_from_drive(GWAS_DRIVE_FILE_ID)
 
         thresholds_df = load_thresholds(THRESHOLDS_FILE)
+        st.session_state["thresholds_df"] = thresholds_df  # persist for narration block
         trait_map = load_trait_map(TRAIT_MAP_FILE)
 
         # Normalize GWAS rsid
@@ -690,6 +691,7 @@ if "analyte_summary_df" in st.session_state and not st.session_state.get("narrat
     if st.button("🗣️ Narrate This Report (Gemini)"):
         narration_results = []
         analyte_df = st.session_state["analyte_summary_df"].copy()
+        thresholds_df = st.session_state.get("thresholds_df", pd.DataFrame())  # retrieve from session state
 
         for _, row in analyte_df.iterrows():
             analyte = row["analyte"]
